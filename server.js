@@ -40,6 +40,8 @@ const MSG_LIMIT = 2000; // Messenger text limit
 
 // In-memory chat history per sender id. (Restarts clear it; use Redis/DB for persistence.)
 const conversations = new Map();
+// Last /model list result per sender, so "/model 3" can pick by number.
+const lastModelList = new Map();
 
 app.get('/', (_req, res) => res.send('Messenger OpenRouter bot is running.'));
 app.get('/health', (_req, res) => res.json({ ok: true, model: currentModel }));
@@ -165,25 +167,31 @@ async function handleModelCommand(psid, text) {
       const models = await fetchModels();
       const free = models.filter((m) => m.id.endsWith(':free'));
       const list = free.length ? free : models.slice(0, 30);
-      await sendText(
-        psid,
-        'Free models:\n' +
-          list
-            .map((m) => {
-              const modalities = (m.architecture && m.architecture.input_modalities) || [];
-              return '- ' + m.id + (modalities.includes('image') ? ' (sees images)' : '');
-            })
-            .join('\n')
-      );
+      lastModelList.set(psid, list.map((m) => m.id));
+      await sendText(psid, 'Free models — tap and hold one to copy:');
+      for (let i = 0; i < list.length; i++) {
+        const m = list[i];
+        const modalities = (m.architecture && m.architecture.input_modalities) || [];
+        const tag = modalities.includes('image') ? ' (sees images)' : '';
+        await sendText(psid, `${i + 1}. ${m.id}${tag}`);
+      }
+      await sendText(psid, 'Or just send /model <number>, e.g. /model 3');
     } catch (err) {
       console.error('model list error:', err.message);
       await sendText(psid, 'Sorry, I ran into an error. Try again in a moment.');
     }
     return;
   }
+  // Allow "/model 3" to pick from the last list shown to this sender.
+  let target = arg;
+  const cached = lastModelList.get(psid);
+  const num = parseInt(arg, 10);
+  if (cached && String(num) === arg && num >= 1 && num <= cached.length) {
+    target = cached[num - 1];
+  }
   try {
     const ids = await fetchModelIds();
-    if (!ids.includes(arg)) {
+    if (!ids.includes(target)) {
       await sendText(psid, `Couldn't find "${arg}" on OpenRouter. Send /model list to see what's available.`);
       return;
     }
@@ -192,9 +200,9 @@ async function handleModelCommand(psid, text) {
     await sendText(psid, 'Sorry, I ran into an error. Try again in a moment.');
     return;
   }
-  currentModel = arg;
-  console.log('Model switched to ' + arg + ' by ' + psid);
-  await sendText(psid, `Switched to ${arg}.`);
+  currentModel = target;
+  console.log('Model switched to ' + target + ' by ' + psid);
+  await sendText(psid, `Switched to ${target}.`);
 }
 
 // Cached OpenRouter model catalogue (refreshed hourly).
