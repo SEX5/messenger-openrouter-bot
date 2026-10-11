@@ -1,0 +1,1 @@
+{"dependencies":{"express":"^4.19.2"},"description":"Facebook Messenger bot powered by OpenRouter free AI models","engines":{"node":">=18"},"main":"server.js","name":"messenger-openrouter-bot","scripts":{"start":"node server.js"},"version":"1.0.0"}
