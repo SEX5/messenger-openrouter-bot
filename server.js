@@ -31,6 +31,12 @@ const FALLBACK_MODELS = (process.env.FALLBACK_MODELS ||
   .map((s) => s.trim())
   .filter(Boolean);
 const REQUEST_TIMEOUT_MS = 60000;
+// Hugging Face Inference Providers — used as a final fallback when OpenRouter fails.
+// Get a token at https://huggingface.co/settings/tokens (needs Inference Providers access).
+const HF_API_KEY = process.env.HF_API_KEY || '';
+const HF_MODEL = process.env.HF_MODEL || 'Qwen/Qwen2.5-72B-Instruct';
+const HF_VISION_MODEL = process.env.HF_VISION_MODEL || 'meta-llama/Llama-3.2-11B-Vision-Instruct';
+const HF_ROUTER_URL = 'https://router.huggingface.co/v1/chat/completions';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are a friendly, helpful assistant chatting on Facebook Messenger. Keep replies concise and conversational.';
@@ -256,6 +262,21 @@ async function askOpenRouter(history, modelOverride) {
       }
     }
   }
+  // Final fallback: Hugging Face Inference Providers (if configured).
+  if (HF_API_KEY) {
+    const hfModel = historyHasImages(history) ? HF_VISION_MODEL : HF_MODEL;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await completeWithHuggingFace(hfModel, history);
+      } catch (err) {
+        lastErr = err;
+        console.error(`huggingface ${hfModel} attempt ${attempt} failed:`, err.message);
+        if (err.authFailed) break; // bad token — retrying won't help
+        if (!err.transient || attempt === 2) break;
+        await sleep(2000 * attempt);
+      }
+    }
+  }
   throw lastErr;
 }
 
@@ -284,15 +305,51 @@ async function completeWithModel(model, history) {
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw orError(res.status, body);
+    throw orError('OpenRouter', res.status, body);
   }
   const data = await res.json();
   const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
   return (content || "I didn't get a reply from the AI. Try again.").trim();
 }
 
-function orError(status, body) {
-  const err = new Error('OpenRouter ' + status + ': ' + body.slice(0, 200));
+async function completeWithHuggingFace(model, history) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      HF_ROUTER_URL,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + HF_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history.slice(-MAX_HISTORY)],
+        }),
+      },
+      REQUEST_TIMEOUT_MS
+    );
+  } catch (err) {
+    throw transientError('network/timeout: ' + err.message);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw orError('HuggingFace', res.status, body);
+  }
+  const data = await res.json();
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  return (content || "I didn't get a reply from the AI. Try again.").trim();
+}
+
+function historyHasImages(history) {
+  return history.some(
+    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === 'image_url')
+  );
+}
+
+function orError(provider, status, body) {
+  const err = new Error(provider + ' ' + status + ': ' + body.slice(0, 200));
   err.status = status;
   err.transient = status === 429 || status >= 500;
   err.authFailed = status === 401 || status === 403;
@@ -320,22 +377,41 @@ function sleep(ms) {
 async function validateApiKey() {
   if (!OPENROUTER_API_KEY) {
     console.error('OPENROUTER_API_KEY is not set — the bot will stay silent.');
+  } else {
+    try {
+      const res = await fetchWithTimeout(
+        'https://openrouter.ai/api/v1/auth/key',
+        { headers: { Authorization: 'Bearer ' + OPENROUTER_API_KEY } },
+        15000
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error('OPENROUTER_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
+      } else {
+        console.log('OpenRouter API key OK.');
+      }
+    } catch (err) {
+      console.error('OPENROUTER_API_KEY check error:', err.message);
+    }
+  }
+  if (!HF_API_KEY) {
+    console.log('HF_API_KEY not set — Hugging Face fallback disabled.');
     return;
   }
   try {
     const res = await fetchWithTimeout(
-      'https://openrouter.ai/api/v1/auth/key',
-      { headers: { Authorization: 'Bearer ' + OPENROUTER_API_KEY } },
+      'https://huggingface.co/api/whoami',
+      { headers: { Authorization: 'Bearer ' + HF_API_KEY } },
       15000
     );
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      console.error('OPENROUTER_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
+      console.error('HF_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
     } else {
-      console.log('OpenRouter API key OK.');
+      console.log('Hugging Face API key OK.');
     }
   } catch (err) {
-    console.error('OPENROUTER_API_KEY check error:', err.message);
+    console.error('HF_API_KEY check error:', err.message);
   }
 }
 

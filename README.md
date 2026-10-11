@@ -64,6 +64,10 @@ models with `(sees images)`.
 - Reliability: transient OpenRouter errors (rate limits, 5xx, timeouts) are retried
   automatically, then the bot falls back through `FALLBACK_MODELS` before giving up.
   A bad API key is reported in the logs at startup via `/auth/key`.
+- Hugging Face fallback: set `HF_API_KEY` (token from
+  https://huggingface.co/settings/tokens) and the bot will try Hugging Face
+  Inference Providers (`HF_MODEL`, vision: `HF_VISION_MODEL`) as a last resort
+  when every OpenRouter model fails.
 - `GET /health` returns `{ ok: true, model }` for uptime monitoring.
 - Note: on Render's free tier the instance spins down when idle, so the first
   message after a while can take ~50 seconds to get a reply. A free uptime
