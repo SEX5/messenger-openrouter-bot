@@ -5,10 +5,14 @@
 //
 // Chat commands (sent to the bot on Messenger):
 //   /model            - show the current model
-//   /model list       - list free models available on OpenRouter
+//   /model list       - list free models available on OpenRouter (vision ones marked)
 //   /model <model-id> - switch to another model (e.g. /model google/gemma-4-26b-a4b-it:free)
 // The switch applies instantly and lasts until the service restarts.
 // Set ADMIN_PSID to your sender id to restrict /model to yourself.
+//
+// Photos: sending a photo (with or without a caption) gets a vision-capable
+// model to describe/answer it. If the current model can't see images, the bot
+// automatically borrows one for that message.
 
 const express = require('express');
 const app = express();
@@ -65,10 +69,17 @@ app.post('/webhook', (req, res) => {
           if (!psid) continue;
           if (event.postback) {
             await handleMessage(psid, event.postback.payload || 'hi');
-          } else if (event.message && !event.message.is_echo && event.message.text) {
-            await handleMessage(psid, event.message.text);
-          } else if (event.message && !event.message.is_echo && !event.message.text) {
-            await handleNonText(psid);
+          } else if (event.message && !event.message.is_echo) {
+            const attachments = event.message.attachments || [];
+            const images = attachments
+              .filter((a) => a.type === 'image' && a.payload && a.payload.url)
+              .map((a) => a.payload.url)
+              .slice(0, 4);
+            if (event.message.text || images.length) {
+              await handleMessage(psid, event.message.text || '', images);
+            } else {
+              await handleNonText(psid);
+            }
           }
         }
       }
@@ -78,7 +89,7 @@ app.post('/webhook', (req, res) => {
   })();
 });
 
-async function handleMessage(psid, text) {
+async function handleMessage(psid, text, images = []) {
   if (!PAGE_ACCESS_TOKEN || !OPENROUTER_API_KEY) {
     console.error('Missing PAGE_ACCESS_TOKEN or OPENROUTER_API_KEY env vars.');
     return;
@@ -90,6 +101,36 @@ async function handleMessage(psid, text) {
   await setTyping(psid, true);
   try {
     const history = conversations.get(psid) || [];
+    let modelForTurn = null;
+    if (images.length) {
+      // Photos need a vision-capable model; borrow one for this message if needed.
+      const vision = await fetchVisionModels();
+      if (!vision.has(currentModel)) {
+        modelForTurn =
+          [...FALLBACK_MODELS, 'google/gemma-4-31b-it:free'].find((m) => vision.has(m)) || currentModel;
+        console.log(`current model ${currentModel} has no vision; using ${modelForTurn} for this image`);
+      }
+      history.push({ role: 'user', content: (text || '[sent a photo]').slice(0, 500) });
+      const reply = await askOpenRouter(
+        [
+          ...history.slice(0, -1),
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: text || 'Describe this image in detail.' },
+              ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+            ],
+          },
+        ],
+        modelForTurn
+      );
+      history.push({ role: 'assistant', content: reply });
+      conversations.set(psid, history.slice(-MAX_HISTORY));
+      for (const chunk of chunkText(reply)) {
+        await sendText(psid, chunk);
+      }
+      return;
+    }
     history.push({ role: 'user', content: text });
     const reply = await askOpenRouter(history);
     history.push({ role: 'assistant', content: reply });
@@ -121,10 +162,19 @@ async function handleModelCommand(psid, text) {
   }
   if (arg.toLowerCase() === 'list') {
     try {
-      const ids = await fetchModelIds();
-      const free = ids.filter((id) => id.endsWith(':free'));
-      const list = free.length ? free : ids.slice(0, 30);
-      await sendText(psid, 'Free models:\n' + list.map((id) => '- ' + id).join('\n'));
+      const models = await fetchModels();
+      const free = models.filter((m) => m.id.endsWith(':free'));
+      const list = free.length ? free : models.slice(0, 30);
+      await sendText(
+        psid,
+        'Free models:\n' +
+          list
+            .map((m) => {
+              const modalities = (m.architecture && m.architecture.input_modalities) || [];
+              return '- ' + m.id + (modalities.includes('image') ? ' (sees images)' : '');
+            })
+            .join('\n')
+      );
     } catch (err) {
       console.error('model list error:', err.message);
       await sendText(psid, 'Sorry, I ran into an error. Try again in a moment.');
@@ -148,29 +198,42 @@ async function handleModelCommand(psid, text) {
 }
 
 // Cached OpenRouter model catalogue (refreshed hourly).
-let modelCache = { at: 0, ids: [] };
-async function fetchModelIds() {
-  if (modelCache.ids.length && Date.now() - modelCache.at < 3600e3) return modelCache.ids;
-  const res = await fetch('https://openrouter.ai/api/v1/models');
+let modelsCache = { at: 0, data: [] };
+async function fetchModels() {
+  if (modelsCache.data.length && Date.now() - modelsCache.at < 3600e3) return modelsCache.data;
+  const res = await fetchWithTimeout('https://openrouter.ai/api/v1/models', {}, 15000);
   if (!res.ok) throw new Error('models list ' + res.status);
   const data = await res.json();
-  modelCache = { at: Date.now(), ids: (data.data || []).map((m) => m.id) };
-  return modelCache.ids;
+  modelsCache = { at: Date.now(), data: data.data || [] };
+  return modelsCache.data;
+}
+async function fetchModelIds() {
+  return (await fetchModels()).map((m) => m.id);
+}
+// Ids of models that accept image input.
+async function fetchVisionModels() {
+  const ids = new Set();
+  for (const m of await fetchModels()) {
+    const modalities = (m.architecture && m.architecture.input_modalities) || [];
+    if (modalities.includes('image')) ids.add(m.id);
+  }
+  return ids;
 }
 
-// Friendly reply for stickers, photos, and other non-text messages.
+// Friendly reply for stickers, files, and other non-text, non-image messages.
 async function handleNonText(psid) {
   if (!PAGE_ACCESS_TOKEN) return;
   try {
-    await sendText(psid, 'I can only read text messages for now — send me text and I\'ll reply.');
+    await sendText(psid, 'I can only read text and photos for now.');
   } catch (err) {
     console.error('non-text reply error:', err.message);
   }
 }
 
-// Tries the current model, then fallbacks; retries transient failures.
-async function askOpenRouter(history) {
-  const models = [currentModel, ...FALLBACK_MODELS.filter((m) => m !== currentModel)];
+// Tries the given (or current) model, then fallbacks; retries transient failures.
+async function askOpenRouter(history, modelOverride) {
+  const first = modelOverride || currentModel;
+  const models = [first, ...FALLBACK_MODELS.filter((m) => m !== first)];
   let lastErr = null;
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {

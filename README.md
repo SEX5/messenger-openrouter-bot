@@ -52,6 +52,12 @@ You can also switch models by chatting with the bot — no redeploy needed:
 The chat-command switch lasts until the service restarts. To stop strangers from
 using it, set `ADMIN_PSID` to your own sender id (only that person can run `/model`).
 
+## Photos
+Send a photo (with or without a caption) and a vision-capable model will describe
+it or answer questions about it. If your current model can't see images, the bot
+automatically borrows one just for that message. `/model list` marks vision
+models with `(sees images)`.
+
 ## Notes
 - Chat history is kept in memory per user (last 20 messages). Restarting the server clears it.
 - Long AI replies are automatically split into Messenger-sized chunks.
