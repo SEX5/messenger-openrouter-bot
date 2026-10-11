@@ -1,6 +1,14 @@
 // Messenger bot powered by OpenRouter free models.
 // Env vars: PAGE_ACCESS_TOKEN, VERIFY_TOKEN, OPENROUTER_API_KEY,
-//           OPENROUTER_MODEL (optional), SYSTEM_PROMPT (optional), PORT (optional)
+//           OPENROUTER_MODEL (optional), SYSTEM_PROMPT (optional),
+//           ADMIN_PSID (optional), PORT (optional)
+//
+// Chat commands (sent to the bot on Messenger):
+//   /model            - show the current model
+//   /model list       - list free models available on OpenRouter
+//   /model <model-id> - switch to another model (e.g. /model google/gemma-4-26b-a4b-it:free)
+// The switch applies instantly and lasts until the service restarts.
+// Set ADMIN_PSID to your sender id to restrict /model to yourself.
 
 const express = require('express');
 const app = express();
@@ -10,6 +18,8 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'openrouter-bot-token';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || 'google/gemma-4-31b-it:free';
+let currentModel = MODEL; // runtime override via the /model chat command
+const ADMIN_PSID = process.env.ADMIN_PSID || ''; // optional: restrict /model to one sender
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are a friendly, helpful assistant chatting on Facebook Messenger. Keep replies concise and conversational.';
@@ -63,6 +73,10 @@ async function handleMessage(psid, text) {
     console.error('Missing PAGE_ACCESS_TOKEN or OPENROUTER_API_KEY env vars.');
     return;
   }
+  if (text.trim().toLowerCase().startsWith('/model')) {
+    await handleModelCommand(psid, text.trim());
+    return;
+  }
   await setTyping(psid, true);
   try {
     const history = conversations.get(psid) || [];
@@ -81,6 +95,59 @@ async function handleMessage(psid, text) {
   }
 }
 
+// /model chat commands: view, list, or switch the active OpenRouter model.
+async function handleModelCommand(psid, text) {
+  if (ADMIN_PSID && psid !== ADMIN_PSID) {
+    await sendText(psid, 'Only the bot owner can change the model.');
+    return;
+  }
+  const arg = text.slice('/model'.length).trim();
+  if (!arg) {
+    await sendText(
+      psid,
+      `Current model: ${currentModel}\n\n/model list - show free models\n/model <model-id> - switch models`
+    );
+    return;
+  }
+  if (arg.toLowerCase() === 'list') {
+    try {
+      const ids = await fetchModelIds();
+      const free = ids.filter((id) => id.endsWith(':free'));
+      const list = free.length ? free : ids.slice(0, 30);
+      await sendText(psid, 'Free models:\n' + list.map((id) => '- ' + id).join('\n'));
+    } catch (err) {
+      console.error('model list error:', err.message);
+      await sendText(psid, 'Sorry, I ran into an error. Try again in a moment.');
+    }
+    return;
+  }
+  try {
+    const ids = await fetchModelIds();
+    if (!ids.includes(arg)) {
+      await sendText(psid, `Couldn't find "${arg}" on OpenRouter. Send /model list to see what's available.`);
+      return;
+    }
+  } catch (err) {
+    console.error('model check error:', err.message);
+    await sendText(psid, 'Sorry, I ran into an error. Try again in a moment.');
+    return;
+  }
+  currentModel = arg;
+  console.log('Model switched to ' + arg + ' by ' + psid);
+  await sendText(psid, `Switched to ${arg}.`);
+}
+
+// Cached OpenRouter model catalogue (refreshed hourly).
+let modelCache = { at: 0, ids: [] };
+async function fetchModelIds() {
+  if (modelCache.ids.length && Date.now() - modelCache.at < 3600e3) return modelCache.ids;
+  const res = await fetch('https://openrouter.ai/api/v1/models');
+  if (!res.ok) throw new Error('models list ' + res.status);
+  const data = await res.json();
+  modelCache = { at: Date.now(), ids: (data.data || []).map((m) => m.id) };
+  return modelCache.ids;
+}
+
 async function askOpenRouter(history) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -91,7 +158,7 @@ async function askOpenRouter(history) {
       'X-Title': 'Messenger OpenRouter Bot',
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: currentModel,
       messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history.slice(-MAX_HISTORY)],
     }),
   });

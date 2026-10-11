@@ -44,6 +44,14 @@ In the Messenger settings you can set a Get Started button / greeting text for t
 Set `OPENROUTER_MODEL` to any free model id (see https://openrouter.ai/models?fmt=free),
 e.g. `nvidia/nemotron-3-ultra-550b-a55b:free` or `openai/gpt-oss-20b:free`.
 
+You can also switch models by chatting with the bot — no redeploy needed:
+- `/model` — show the current model
+- `/model list` — list free models on OpenRouter
+- `/model <model-id>` — switch to another model instantly
+
+The chat-command switch lasts until the service restarts. To stop strangers from
+using it, set `ADMIN_PSID` to your own sender id (only that person can run `/model`).
+
 ## Notes
 - Chat history is kept in memory per user (last 20 messages). Restarting the server clears it.
 - Long AI replies are automatically split into Messenger-sized chunks.
