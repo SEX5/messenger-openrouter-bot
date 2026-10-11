@@ -55,3 +55,10 @@ using it, set `ADMIN_PSID` to your own sender id (only that person can run `/mod
 ## Notes
 - Chat history is kept in memory per user (last 20 messages). Restarting the server clears it.
 - Long AI replies are automatically split into Messenger-sized chunks.
+- Reliability: transient OpenRouter errors (rate limits, 5xx, timeouts) are retried
+  automatically, then the bot falls back through `FALLBACK_MODELS` before giving up.
+  A bad API key is reported in the logs at startup via `/auth/key`.
+- `GET /health` returns `{ ok: true, model }` for uptime monitoring.
+- Note: on Render's free tier the instance spins down when idle, so the first
+  message after a while can take ~50 seconds to get a reply. A free uptime
+  pinger (or a paid instance) fixes that.

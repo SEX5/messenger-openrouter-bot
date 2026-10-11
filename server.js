@@ -20,6 +20,13 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || 'google/gemma-4-31b-it:free';
 let currentModel = MODEL; // runtime override via the /model chat command
 const ADMIN_PSID = process.env.ADMIN_PSID || ''; // optional: restrict /model to one sender
+// Models to try automatically if the current one errors (comma-separated).
+const FALLBACK_MODELS = (process.env.FALLBACK_MODELS ||
+  'google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,thinkingmachines/inkling:free')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const REQUEST_TIMEOUT_MS = 60000;
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are a friendly, helpful assistant chatting on Facebook Messenger. Keep replies concise and conversational.';
@@ -31,6 +38,7 @@ const MSG_LIMIT = 2000; // Messenger text limit
 const conversations = new Map();
 
 app.get('/', (_req, res) => res.send('Messenger OpenRouter bot is running.'));
+app.get('/health', (_req, res) => res.json({ ok: true, model: currentModel }));
 
 // Webhook verification (Meta calls this once when you save the webhook URL)
 app.get('/webhook', (req, res) => {
@@ -59,6 +67,8 @@ app.post('/webhook', (req, res) => {
             await handleMessage(psid, event.postback.payload || 'hi');
           } else if (event.message && !event.message.is_echo && event.message.text) {
             await handleMessage(psid, event.message.text);
+          } else if (event.message && !event.message.is_echo && !event.message.text) {
+            await handleNonText(psid);
           }
         }
       }
@@ -148,27 +158,114 @@ async function fetchModelIds() {
   return modelCache.ids;
 }
 
+// Friendly reply for stickers, photos, and other non-text messages.
+async function handleNonText(psid) {
+  if (!PAGE_ACCESS_TOKEN) return;
+  try {
+    await sendText(psid, 'I can only read text messages for now — send me text and I\'ll reply.');
+  } catch (err) {
+    console.error('non-text reply error:', err.message);
+  }
+}
+
+// Tries the current model, then fallbacks; retries transient failures.
 async function askOpenRouter(history) {
-  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + OPENROUTER_API_KEY,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com/',
-      'X-Title': 'Messenger OpenRouter Bot',
-    },
-    body: JSON.stringify({
-      model: currentModel,
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history.slice(-MAX_HISTORY)],
-    }),
-  });
+  const models = [currentModel, ...FALLBACK_MODELS.filter((m) => m !== currentModel)];
+  let lastErr = null;
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await completeWithModel(model, history);
+      } catch (err) {
+        lastErr = err;
+        console.error(`model ${model} attempt ${attempt} failed:`, err.message);
+        if (err.authFailed) throw err; // bad API key — other models won't help
+        if (!err.transient || attempt === 2) break;
+        await sleep(2000 * attempt);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+async function completeWithModel(model, history) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + OPENROUTER_API_KEY,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/',
+          'X-Title': 'Messenger OpenRouter Bot',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history.slice(-MAX_HISTORY)],
+        }),
+      },
+      REQUEST_TIMEOUT_MS
+    );
+  } catch (err) {
+    throw transientError('network/timeout: ' + err.message);
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error('OpenRouter ' + res.status + ': ' + body.slice(0, 200));
+    throw orError(res.status, body);
   }
   const data = await res.json();
   const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
   return (content || "I didn't get a reply from the AI. Try again.").trim();
+}
+
+function orError(status, body) {
+  const err = new Error('OpenRouter ' + status + ': ' + body.slice(0, 200));
+  err.status = status;
+  err.transient = status === 429 || status >= 500;
+  err.authFailed = status === 401 || status === 403;
+  return err;
+}
+
+function transientError(message) {
+  const err = new Error(message);
+  err.transient = true;
+  return err;
+}
+
+function fetchWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Validates the OpenRouter API key once at startup so a bad key shows up
+// in the logs immediately instead of failing on the first message.
+async function validateApiKey() {
+  if (!OPENROUTER_API_KEY) {
+    console.error('OPENROUTER_API_KEY is not set — the bot will stay silent.');
+    return;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      'https://openrouter.ai/api/v1/auth/key',
+      { headers: { Authorization: 'Bearer ' + OPENROUTER_API_KEY } },
+      15000
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error('OPENROUTER_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
+    } else {
+      console.log('OpenRouter API key OK.');
+    }
+  } catch (err) {
+    console.error('OPENROUTER_API_KEY check error:', err.message);
+  }
 }
 
 async function graph(path, payload) {
@@ -212,4 +309,7 @@ function chunkText(text) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Bot listening on port ' + PORT));
+app.listen(PORT, () => {
+  console.log('Bot listening on port ' + PORT);
+  validateApiKey();
+});
