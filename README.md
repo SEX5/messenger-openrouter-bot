@@ -68,6 +68,13 @@ models with `(sees images)`.
   https://huggingface.co/settings/tokens) and the bot will try Hugging Face
   Inference Providers (`HF_MODEL`, vision: `HF_VISION_MODEL`) as a last resort
   when every OpenRouter model fails.
+- Claude (Anthropic): set `ANTHROPIC_API_KEY` (from
+  https://console.anthropic.com/, paid pay-as-you-go) and Claude answers
+  **first**, with OpenRouter/Hugging Face as fallbacks. Pick the model with
+  `ANTHROPIC_MODEL` (default `claude-haiku-4-5-20251001`, the cheapest).
+  Photos work too — Messenger image URLs are passed to Claude as image blocks.
+  Note: this is a stock Claude model via API, not a personal assistant with
+  memory of you; it only sees the current chat history and `SYSTEM_PROMPT`.
 - `GET /health` returns `{ ok: true, model }` for uptime monitoring.
 - Note: on Render's free tier the instance spins down when idle, so the first
   message after a while can take ~50 seconds to get a reply. A free uptime

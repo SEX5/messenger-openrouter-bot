@@ -1,7 +1,10 @@
-// Messenger bot powered by OpenRouter free models.
+// Messenger bot powered by OpenRouter free models, with optional Claude
+// (Anthropic) and Hugging Face providers.
 // Env vars: PAGE_ACCESS_TOKEN, VERIFY_TOKEN, OPENROUTER_API_KEY,
 //           OPENROUTER_MODEL (optional), SYSTEM_PROMPT (optional),
-//           ADMIN_PSID (optional), PORT (optional)
+//           ADMIN_PSID (optional), PORT (optional),
+//           ANTHROPIC_API_KEY (optional), ANTHROPIC_MODEL (optional),
+//           HF_API_KEY (optional), HF_MODEL / HF_VISION_MODEL (optional)
 //
 // Chat commands (sent to the bot on Messenger):
 //   /model            - show the current model
@@ -37,6 +40,11 @@ const HF_API_KEY = process.env.HF_API_KEY || '';
 const HF_MODEL = process.env.HF_MODEL || 'Qwen/Qwen2.5-72B-Instruct';
 const HF_VISION_MODEL = process.env.HF_VISION_MODEL || 'meta-llama/Llama-3.2-11B-Vision-Instruct';
 const HF_ROUTER_URL = 'https://router.huggingface.co/v1/chat/completions';
+// Anthropic (Claude) — when ANTHROPIC_API_KEY is set, Claude answers FIRST and
+// OpenRouter / Hugging Face act as fallbacks. Get a key at https://console.anthropic.com/
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are a friendly, helpful assistant chatting on Facebook Messenger. Keep replies concise and conversational.';
@@ -98,8 +106,8 @@ app.post('/webhook', (req, res) => {
 });
 
 async function handleMessage(psid, text, images = []) {
-  if (!PAGE_ACCESS_TOKEN || !OPENROUTER_API_KEY) {
-    console.error('Missing PAGE_ACCESS_TOKEN or OPENROUTER_API_KEY env vars.');
+  if (!PAGE_ACCESS_TOKEN || (!OPENROUTER_API_KEY && !HF_API_KEY && !ANTHROPIC_API_KEY)) {
+    console.error('Missing PAGE_ACCESS_TOKEN or any AI provider API key env vars.');
     return;
   }
   if (text.trim().toLowerCase().startsWith('/model')) {
@@ -162,9 +170,12 @@ async function handleModelCommand(psid, text) {
   }
   const arg = text.slice('/model'.length).trim();
   if (!arg) {
+    const lead = ANTHROPIC_API_KEY
+      ? `Claude (${ANTHROPIC_MODEL}) is answering first while ANTHROPIC_API_KEY is set.\nOpenRouter model: ${currentModel}`
+      : `Current model: ${currentModel}`;
     await sendText(
       psid,
-      `Current model: ${currentModel}\n\n/model list - show free models\n/model <model-id> - switch models`
+      `${lead}\n\n/model list - show free models\n/model <model-id> - switch models`
     );
     return;
   }
@@ -244,21 +255,40 @@ async function handleNonText(psid) {
   }
 }
 
-// Tries the given (or current) model, then fallbacks; retries transient failures.
+// Provider chain: Claude (Anthropic) first when configured, then OpenRouter
+// models, then Hugging Face. Each provider retries transient failures, and a
+// bad key only skips that provider — it never aborts the whole chain.
 async function askOpenRouter(history, modelOverride) {
-  const first = modelOverride || currentModel;
-  const models = [first, ...FALLBACK_MODELS.filter((m) => m !== first)];
   let lastErr = null;
-  for (const model of models) {
+
+  if (ANTHROPIC_API_KEY) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        return await completeWithModel(model, history);
+        return await completeWithAnthropic(history);
       } catch (err) {
         lastErr = err;
-        console.error(`model ${model} attempt ${attempt} failed:`, err.message);
-        if (err.authFailed) throw err; // bad API key — other models won't help
-        if (!err.transient || attempt === 2) break;
+        console.error(`anthropic ${ANTHROPIC_MODEL} attempt ${attempt} failed:`, err.message);
+        if (err.authFailed || !err.transient || attempt === 2) break;
         await sleep(2000 * attempt);
+      }
+    }
+  }
+
+  if (OPENROUTER_API_KEY) {
+    const first = modelOverride || currentModel;
+    const models = [first, ...FALLBACK_MODELS.filter((m) => m !== first)];
+    openrouterLoop:
+    for (const model of models) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          return await completeWithModel(model, history);
+        } catch (err) {
+          lastErr = err;
+          console.error(`model ${model} attempt ${attempt} failed:`, err.message);
+          if (err.authFailed) break openrouterLoop; // bad key — other OpenRouter models won't help
+          if (!err.transient || attempt === 2) break;
+          await sleep(2000 * attempt);
+        }
       }
     }
   }
@@ -277,7 +307,7 @@ async function askOpenRouter(history, modelOverride) {
       }
     }
   }
-  throw lastErr;
+  throw lastErr || new Error('No AI provider configured.');
 }
 
 async function completeWithModel(model, history) {
@@ -348,6 +378,74 @@ function historyHasImages(history) {
   );
 }
 
+async function completeWithAnthropic(history) {
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      ANTHROPIC_URL,
+      {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL,
+          max_tokens: 1024,
+          system: SYSTEM_PROMPT,
+          messages: toAnthropicMessages(history),
+        }),
+      },
+      REQUEST_TIMEOUT_MS
+    );
+  } catch (err) {
+    throw transientError('network/timeout: ' + err.message);
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw orError('Anthropic', res.status, body);
+  }
+  const data = await res.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
+  return (text || "I didn't get a reply from the AI. Try again.").trim();
+}
+
+// Converts the bot's OpenAI-style history into Anthropic Messages format:
+// image_url parts become image blocks, and consecutive same-role turns are
+// merged because Anthropic expects alternating user/assistant messages.
+function toAnthropicMessages(history) {
+  const out = [];
+  for (const m of history.slice(-MAX_HISTORY)) {
+    if (m.role !== 'user' && m.role !== 'assistant') continue;
+    let blocks;
+    if (typeof m.content === 'string') {
+      blocks = [{ type: 'text', text: m.content }];
+    } else if (Array.isArray(m.content)) {
+      blocks = m.content
+        .map((p) => {
+          if (p.type === 'text') return { type: 'text', text: p.text };
+          if (p.type === 'image_url' && p.image_url && p.image_url.url) {
+            return { type: 'image', source: { type: 'url', url: p.image_url.url } };
+          }
+          return null;
+        })
+        .filter(Boolean);
+    }
+    if (!blocks || !blocks.length) continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.role === m.role) {
+      prev.content = prev.content.concat(blocks);
+    } else {
+      out.push({ role: m.role, content: blocks });
+    }
+  }
+  return out;
+}
+
 function orError(provider, status, body) {
   const err = new Error(provider + ' ' + status + ': ' + body.slice(0, 200));
   err.status = status;
@@ -396,22 +494,46 @@ async function validateApiKey() {
   }
   if (!HF_API_KEY) {
     console.log('HF_API_KEY not set — Hugging Face fallback disabled.');
+  } else {
+    try {
+      const res = await fetchWithTimeout(
+        'https://huggingface.co/api/whoami',
+        { headers: { Authorization: 'Bearer ' + HF_API_KEY } },
+        15000
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error('HF_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
+      } else {
+        console.log('Hugging Face API key OK.');
+      }
+    } catch (err) {
+      console.error('HF_API_KEY check error:', err.message);
+    }
+  }
+  if (!ANTHROPIC_API_KEY) {
+    console.log('ANTHROPIC_API_KEY not set — Claude provider disabled.');
     return;
   }
   try {
     const res = await fetchWithTimeout(
-      'https://huggingface.co/api/whoami',
-      { headers: { Authorization: 'Bearer ' + HF_API_KEY } },
+      'https://api.anthropic.com/v1/models',
+      {
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+      },
       15000
     );
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      console.error('HF_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
+      console.error('ANTHROPIC_API_KEY check failed: HTTP ' + res.status + ' ' + body.slice(0, 200));
     } else {
-      console.log('Hugging Face API key OK.');
+      console.log('Anthropic API key OK (Claude model: ' + ANTHROPIC_MODEL + ').');
     }
   } catch (err) {
-    console.error('HF_API_KEY check error:', err.message);
+    console.error('ANTHROPIC_API_KEY check error:', err.message);
   }
 }
 
